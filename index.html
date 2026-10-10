@@ -1,0 +1,109 @@
+<html>
+<head>
+<title>Varanasi Precipitation Predictor</title>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.1/dist/ort.min.js"></script>
+</head>
+<body>
+<h1>Varanasi Precipitation Predictor</h1>
+<p>Enter the conditions at a point. Your browser runs a Random Forest, a U-Net and a ConvLSTM, and a trained linear regression blends them into the final precipitation value.</p>
+<p id="status">Loading models...</p>
+
+<h2>Inputs</h2>
+<table>
+<tr><td>Latitude (degrees N)</td><td><input type="number" id="lat" step="any" value="25.3177"></td></tr>
+<tr><td>Longitude (degrees E)</td><td><input type="number" id="lon" step="any" value="82.9739"></td></tr>
+<tr><td>Timestamp (UTC)</td><td><input type="datetime-local" id="ts" value="2023-07-15T06:00"></td></tr>
+<tr><td>Skin temperature (K)</td><td><input type="number" id="skin" step="any" value="309.6"></td></tr>
+<tr><td>Surface pressure (Pa)</td><td><input type="number" id="pres" step="any" value="99190"></td></tr>
+<tr><td>Total cloud cover (0 to 1)</td><td><input type="number" id="cloud" step="any" min="0" max="1" value="0.94"></td></tr>
+<tr><td>Wind U component, 10 m (m/s, east is positive)</td><td><input type="number" id="u" step="any" value="-2.26"></td></tr>
+<tr><td>Wind V component, 10 m (m/s, north is positive)</td><td><input type="number" id="v" step="any" value="0.36"></td></tr>
+</table>
+<p><button type="button" onclick="predict()">Predict precipitation</button></p>
+
+<h2>Result</h2>
+<p id="point"></p>
+<table border="1">
+<tr><th>Model</th><th>Precipitation (mm per hour)</th></tr>
+<tr><td>Random Forest</td><td id="r0"></td></tr>
+<tr><td>U-Net</td><td id="r1"></td></tr>
+<tr><td>ConvLSTM</td><td id="r2"></td></tr>
+<tr><td><b>Final (blended)</b></td><td id="r3"></td></tr>
+</table>
+<p id="note"></p>
+
+<script>
+var cfg,rf,unet,clstm;
+function $(id){return document.getElementById(id)}
+async function init(){
+  try{
+    cfg=await (await fetch('config.json')).json();
+    rf=await (await fetch('rf.json')).json();
+    unet=await ort.InferenceSession.create('unet.onnx');
+    clstm=await ort.InferenceSession.create('convlstm.onnx');
+    $('status').innerText='Models ready.';
+  }catch(e){
+    $('status').innerText='Could not load the models: '+e+'. Open this page through GitHub Pages or a local web server, not by double-clicking the file.';
+  }
+}
+init();
+function treePredict(t,x){
+  var n=0;
+  while(t.f[n]>=0){n=x[t.f[n]]<=t.t[n]?t.l[n]:t.r[n]}
+  return t.v[n];
+}
+async function predict(){
+  if(!unet||!clstm){$('status').innerText='The models are not loaded yet.';return}
+  var lat=parseFloat($('lat').value),lon=parseFloat($('lon').value),skin=parseFloat($('skin').value),pres=parseFloat($('pres').value),cloud=parseFloat($('cloud').value),u=parseFloat($('u').value),v=parseFloat($('v').value);
+  var ts=$('ts').value;
+  if(!ts||[lat,lon,skin,pres,cloud,u,v].some(isNaN)){$('status').innerText='Please fill in every input.';return}
+  var d=new Date(ts+(ts.length==16?':00':'')+'Z');
+  if(isNaN(d.getTime())){$('status').innerText='The timestamp is not valid.';return}
+  var hour=d.getUTCHours();
+  var doy=Math.floor((d-Date.UTC(d.getUTCFullYear(),0,0))/86400000);
+  var C=cfg.features.length,n=256,best=1e9,bi=0,bj=0,cs=Math.cos(lat*Math.PI/180);
+  for(var i=0;i<16;i++)for(var j=0;j<16;j++){
+    if(cfg.mask[i][j]==1){
+      var dy=cfg.cell_lat[i][j]-lat,dx=(cfg.cell_lon[i][j]-lon)*cs,dd=dy*dy+dx*dx;
+      if(dd<best){best=dd;bi=i;bj=j}
+    }
+  }
+  var km=Math.sqrt(best)*111;
+  var raw={skin_temperature_K:skin,surface_pressure_Pa:pres,total_cloud_cover:cloud,u_wind_10m_ms:u,v_wind_10m_ms:v,hour_sin:Math.sin(2*Math.PI*hour/24),hour_cos:Math.cos(2*Math.PI*hour/24),doy_sin:Math.sin(2*Math.PI*doy/365.25),doy_cos:Math.cos(2*Math.PI*doy/365.25)};
+  function nv(c,i,j){
+    var name=cfg.features[c],val;
+    if(name=='latitude')val=cfg.cell_lat[i][j];
+    else if(name=='longitude')val=cfg.cell_lon[i][j];
+    else val=raw[name];
+    return (val-cfg.mu[c])/cfg.sd[c];
+  }
+  var x=new Float32Array((C+1)*n);
+  for(var i=0;i<16;i++)for(var j=0;j<16;j++){
+    if(cfg.mask[i][j]==1){
+      for(var c=0;c<C;c++)x[c*n+i*16+j]=nv(c,i,j);
+      x[C*n+i*16+j]=1;
+    }
+  }
+  var xs=new Float32Array(cfg.seq*(C+1)*n);
+  for(var t=0;t<cfg.seq;t++)xs.set(x,t*(C+1)*n);
+  var o1=(await unet.run({input:new ort.Tensor('float32',x,[1,C+1,16,16])})).output.data;
+  var o2=(await clstm.run({input:new ort.Tensor('float32',xs,[1,cfg.seq,C+1,16,16])})).output.data;
+  var k=bi*16+bj;
+  var xr=[];
+  for(var c=0;c<C;c++)xr.push(nv(c,bi,bj));
+  var s=0;
+  for(var q=0;q<rf.length;q++)s+=treePredict(rf[q],xr);
+  var z=[s/rf.length,o1[k],o2[k]].map(function(a){return Math.max(0,a)});
+  var zf=cfg.blend.intercept+cfg.blend.coef[0]*z[0]+cfg.blend.coef[1]*z[1]+cfg.blend.coef[2]*z[2];
+  var mm=function(a){return Math.expm1(Math.max(0,a))};
+  $('r0').innerText=mm(z[0]).toFixed(3);
+  $('r1').innerText=mm(z[1]).toFixed(3);
+  $('r2').innerText=mm(z[2]).toFixed(3);
+  $('r3').innerText=mm(zf).toFixed(3);
+  $('point').innerText='Grid point used: '+cfg.cell_lat[bi][bj].toFixed(4)+' N, '+cfg.cell_lon[bi][bj].toFixed(4)+' E ('+km.toFixed(1)+' km from the entered point). Time used: '+d.toISOString().slice(0,16)+' UTC.';
+  $('note').innerText=km>12?'Warning: the entered point is outside the area the models were trained on, so treat this value with caution.':'';
+  $('status').innerText='Models ready.';
+}
+</script>
+</body>
+</html>
